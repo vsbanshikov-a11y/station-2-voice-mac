@@ -1,0 +1,79 @@
+<!doctype html><meta charset="utf-8"><title>Локальный голосовой канал</title>
+<script>
+// This page is served only on loopback under a per-run secret URL. It never
+// opens the Mac microphone. The station supplies already processed PCM.
+const report = data => fetch('event', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).catch(()=>{});
+const workletSource = `
+class InputPCM extends AudioWorkletProcessor {
+  constructor(){super();this.queue=[];this.index=0;this.count=0;this.phase=0;this.sample=0;
+    this.port.onmessage=e=>{const data=new Int16Array(e.data);if(!data.length)return;
+      this.queue.push(data);this.count+=data.length;
+      while(this.count>16000 && this.queue.length>1){this.count-=this.queue[0].length-this.index;this.queue.shift();this.index=0;}
+    };}
+  take(){while(this.queue.length && this.index>=this.queue[0].length){this.queue.shift();this.index=0;}
+    if(!this.queue.length)return 0;this.count--;return this.queue[0][this.index++]/32768;}
+  process(inputs,outputs){const output=outputs[0][0];if(!output)return true;
+    for(let i=0;i<output.length;i++){this.phase+=16000/sampleRate;
+      while(this.phase>=1){this.sample=this.take();this.phase-=1;}output[i]=this.sample;}
+    return true;}
+}
+registerProcessor('station-input',InputPCM);`;
+
+const pc = new RTCPeerConnection({iceServers:[]});
+const dc = pc.createDataChannel('oai-events');
+let audioContext, inputNode, player, outBusy=false;
+dc.onopen=()=>report({kind:'channel_open'});
+dc.onmessage=e=>{try{
+  const m=JSON.parse(e.data);
+  if(m.type==='input_transcript.added'){
+    report({kind:'input_heard'});
+    const text=(m.item?.text||'').toLocaleLowerCase('ru').replace(/ё/g,'е').replace(/[^a-zа-я0-9]+/g,' ').trim();
+    if(['возвращаемся в чат','чат возвращаемся в чат','чат вернись в чат'].includes(text))report({kind:'switch_to_chat'});
+  }
+  if(m.type==='output_transcript.added')report({kind:'assistant_spoke'});
+  if(m.type==='error')report({kind:'server_error'});
+  if(m.type==='session.closed')report({kind:'session_closed'});
+}catch(_){}};
+pc.onconnectionstatechange=()=>report({kind:'connection',state:pc.connectionState});
+pc.ontrack=e=>{
+  player=new Audio();player.autoplay=true;player.volume=0;player.srcObject=new MediaStream([e.track]);
+  player.play().catch(()=>report({kind:'player_error'}));
+  const src=audioContext.createMediaStreamSource(new MediaStream([e.track]));
+  const capture=audioContext.createScriptProcessor(4096,1,1);
+  const silence=audioContext.createGain();silence.gain.value=0;
+  src.connect(capture);capture.connect(silence);silence.connect(audioContext.destination);
+  capture.onaudioprocess=event=>{
+    if(outBusy)return;
+    const samples=event.inputBuffer.getChannelData(0), pcm=new Int16Array(samples.length*2);
+    for(let i=0;i<samples.length;i++){const x=Math.max(-1,Math.min(1,samples[i]));
+      const v=x<0?Math.round(x*32768):Math.round(x*32767);pcm[i*2]=v;pcm[i*2+1]=v;}
+    outBusy=true;fetch('speaker',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:pcm.buffer})
+      .catch(()=>report({kind:'speaker_error'})).finally(()=>{outBusy=false;});
+  };
+  report({kind:'audio_track'});
+};
+async function pumpMicrophone(){
+  const response=await fetch('microphone');if(!response.ok)throw Error('input');
+  const reader=response.body.getReader();let carry=null;
+  for(;;){const {done,value}=await reader.read();if(done)break;
+    let bytes=value;if(carry!==null){const next=new Uint8Array(bytes.length+1);next[0]=carry;next.set(bytes,1);bytes=next;carry=null;}
+    if(bytes.length%2){carry=bytes[bytes.length-1];bytes=bytes.slice(0,-1);}
+    if(bytes.length){const buf=bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength);inputNode.port.postMessage(buf,[buf]);}
+  }
+}
+(async()=>{try{
+  audioContext=new AudioContext({sampleRate:48000});
+  const blob=URL.createObjectURL(new Blob([workletSource],{type:'text/javascript'}));
+  await audioContext.audioWorklet.addModule(blob);URL.revokeObjectURL(blob);
+  inputNode=new AudioWorkletNode(audioContext,'station-input',{numberOfInputs:0,numberOfOutputs:1,outputChannelCount:[1]});
+  const dest=audioContext.createMediaStreamDestination();inputNode.connect(dest);await audioContext.resume();
+  pc.addTrack(dest.stream.getAudioTracks()[0],dest.stream);pumpMicrophone().catch(()=>report({kind:'microphone_error'}));
+  await pc.setLocalDescription(await pc.createOffer());
+  if(pc.iceGatheringState!=='complete')await Promise.race([new Promise(resolve=>{
+    pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')resolve();});
+  }),new Promise(resolve=>setTimeout(resolve,4000))]);
+  const r=await fetch('offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:pc.localDescription.sdp})});
+  if(!r.ok)throw Error('offer');const answer=await r.json();await pc.setRemoteDescription({type:'answer',sdp:answer.sdp});
+  report({kind:'answer_set'});
+}catch(_){report({kind:'browser_error'});}})();
+</script>

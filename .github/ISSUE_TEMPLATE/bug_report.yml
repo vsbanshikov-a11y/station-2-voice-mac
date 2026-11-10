@@ -1,0 +1,30 @@
+name: Сообщить об ошибке
+description: Опишите проблему без персональных данных и секретов.
+body:
+  - type: markdown
+    attributes:
+      value: Не прикладывайте SSH-ключи, пароли, токены, cookies, IP-адреса, разговоры или данные календаря.
+  - type: input
+    id: device
+    attributes:
+      label: Модель и версия прошивки колонки
+      placeholder: Например, Станция 2 и версия без идентификатора устройства
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Версия macOS и модель Mac
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Что вы сделали и что произошло?
+      description: Укажите шаги и текст ошибки без личных данных.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что вы ожидали?
